@@ -122,8 +122,8 @@ class NeuralNetworkCompressor:
         while T >= self.Tmin:
             L_old = float('inf')
             while True:
-                # Calculate distortion matrix
-                D = self.calculate_distortion(X_tensor, Y)
+                # Calculate distance matrix
+                D = self.calculate_distortion(X_tensor, Y)  # d_ij = d(x(i), z(j))
                 
                 # Calculate probability matrix using softmax
                 D_bar = D - torch.min(D, dim=1, keepdim=True).values
@@ -335,28 +335,29 @@ class NeuralNetworkCompressor:
         
         # 5. SEPARATE (Done before distortion measurement to get new weights)
         new_aug_w1 = centroids[:, :augmented_W1.shape[1]]
-        new_w2_t = centroids[:, augmented_W1.shape[1]:]
-        new_w1 = new_aug_w1[:, :-1]
+        # new_w2_t = centroids[:, augmented_W1.shape[1]:]
+        # new_w1 = new_aug_w1[:, :-1]
         new_b1 = new_aug_w1[:, -1]
-        new_w2 = new_w2_t.T
+        # new_w2 = new_w2_t.T
 
 
         # Original Weights multiplied by the association matrix
-        # p_sum = np.sum(P_T, axis = 1)
-        # p_sum = p_sum.reshape(-1,1)
-        # # print(p_sum)
+        p_sum = np.sum(P_T, axis = 1)
+        p_sum = p_sum.reshape(-1,1)
+        # print(p_sum)
         # print()
 
-        # print(P.shape)
+        print(P_T.shape)
+        print(b1.shape)
         
-        # W1_M_P = ((P_T)@W1)/p_sum
-        # b1_M_P = ((P_T)@b1)/p_sum
-        # W2_M_P = (P_T@W2_T)/p_sum
-        # W2_M_P = W2_M_P.T
+        W1_M_P = ((P_T)@W1)/p_sum
+        b1_M_P = (P_T@b1)/p_sum
+        W2_M_P = (P_T@W2_T)/p_sum
+        W2_M_P = W2_M_P.T
 
-        # new_w1 = W1_M_P
+        new_w1 = W1_M_P
         # new_b1 = b1_M_P
-        # new_w2 = W2_M_P
+        new_w2 = W2_M_P
         
         # print(new_w1)
         # print()
@@ -365,6 +366,7 @@ class NeuralNetworkCompressor:
         # print()
         # print(new_b1)
         # print()
+        # print(b1_M_P)
         # print("new_w2")
         # print(new_w2)
         # print()
@@ -376,7 +378,10 @@ class NeuralNetworkCompressor:
         new_w1_tensor = torch.tensor(new_w1, device=device, dtype=dtype)
         W1_recon_tensor = P_tensor @ new_w1_tensor
 
-        # print(W1_recon_tensor)
+        print(W1_recon_tensor.shape)
+        print(P_tensor.shape)
+        print(W1.shape)
+        
         # print()
         
         new_w2_tensor = torch.tensor(new_w2, device=device, dtype=dtype)
@@ -415,110 +420,110 @@ class NeuralNetworkCompressor:
         return new_current_layer, new_next_layer, P
 
     
-    # def compress_model(self):
-    #     """
-    #     Compress the entire neural network model, adjusting subsequent layers.
-    #     Now compresses all hidden layers including the first one (fc1),
-    #     while not compressing the input layer and output layer.
-    #     """
-    #     compressed_model = deepcopy(self.model)
+    def compress_model_old(self):
+        """
+        Compress the entire neural network model, adjusting subsequent layers.
+        Now compresses all hidden layers including the first one (fc1),
+        while not compressing the input layer and output layer.
+        """
+        compressed_model = deepcopy(self.model)
         
-    #     # Try to move compressed model to device with error handling
-    #     try:
-    #         compressed_model.to(self.device)
-    #         print("Model successfully moved to device and Compressing...")
-    #     except Exception as e:
-    #         print(f"Error moving compressed model to device: {e}")
-    #         print("Falling back to CPU.")
-    #         self.device = torch.device("cpu")
-    #         compressed_model.to(self.device)
-    #         self.model.to(self.device)
+        # Try to move compressed model to device with error handling
+        try:
+            compressed_model.to(self.device)
+            print("Model successfully moved to device and Compressing...")
+        except Exception as e:
+            print(f"Error moving compressed model to device: {e}")
+            print("Falling back to CPU.")
+            self.device = torch.device("cpu")
+            compressed_model.to(self.device)
+            self.model.to(self.device)
         
-    #     self.association_matrices = {}
-    #     prev_P = None
-    #     prev_layer_name = None
+        self.association_matrices = {}
+        prev_P = None
+        prev_layer_name = None
 
         
-    #     # Get a list of all modules in the model
-    #     modules = list(compressed_model.named_modules())
+        # Get a list of all modules in the model
+        modules = list(compressed_model.named_modules())
 
-    #     # First pass: identify compressible layers
-    #     # Collect all linear and conv layers
-    #     linear_conv_layers = []
-    #     for name, module in modules:
-    #         if isinstance(module, (nn.Linear, nn.Conv2d)):
-    #             linear_conv_layers.append((name, module))
+        # First pass: identify compressible layers
+        # Collect all linear and conv layers
+        linear_conv_layers = []
+        for name, module in modules:
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                linear_conv_layers.append((name, module))
         
-    #     # The first layer is the input layer, the last layer is the output layer
-    #     input_layer_name = linear_conv_layers[0][0]
-    #     output_layer_name = linear_conv_layers[-1][0]
+        # The first layer is the input layer, the last layer is the output layer
+        input_layer_name = linear_conv_layers[0][0]
+        output_layer_name = linear_conv_layers[-1][0]
         
-    #     print(f"Input layer: {input_layer_name}")
-    #     print(f"Output layer: {output_layer_name}")
+        print(f"Input layer: {input_layer_name}")
+        print(f"Output layer: {output_layer_name}")
         
-    #     # Second pass: compress layers and adjust dimensions
-    #     for name, module in modules:
-    #         if isinstance(module, (nn.Linear, nn.Conv2d)):
-    #             # Get parent module and attribute name
-    #             path = name.split('.')
-    #             parent = compressed_model
-    #             for p in path[:-1]:
-    #                 parent = getattr(parent, p)
-    #             attr_name = path[-1]
-    #             layer = getattr(parent, attr_name)
+        # Second pass: compress layers and adjust dimensions
+        for name, module in modules:
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                # Get parent module and attribute name
+                path = name.split('.')
+                parent = compressed_model
+                for p in path[:-1]:
+                    parent = getattr(parent, p)
+                attr_name = path[-1]
+                layer = getattr(parent, attr_name)
                 
-    #             # If this layer follows a compressed layer, adjust its input dimensions
-    #             if prev_P is not None:
-    #                 # Convert P to tensor and move to device
-    #                 try:
-    #                     P_tensor = torch.tensor(prev_P, dtype=torch.float32, device=self.device)
-    #                 except Exception as e:
-    #                     print(f"Error creating P tensor on device: {e}")
-    #                     print("Falling back to CPU for this operation.")
-    #                     P_tensor = torch.tensor(prev_P, dtype=torch.float32, device='cpu')
+                # If this layer follows a compressed layer, adjust its input dimensions
+                if prev_P is not None:
+                    # Convert P to tensor and move to device
+                    try:
+                        P_tensor = torch.tensor(prev_P, dtype=torch.float32, device=self.device)
+                    except Exception as e:
+                        print(f"Error creating P tensor on device: {e}")
+                        print("Falling back to CPU for this operation.")
+                        P_tensor = torch.tensor(prev_P, dtype=torch.float32, device='cpu')
                     
-    #                 if isinstance(layer, nn.Linear):
-    #                     # Adjust input dimensions for linear layer
-    #                     original_weight = layer.weight.data
-    #                     new_weight = original_weight @ P_tensor
+                    if isinstance(layer, nn.Linear):
+                        # Adjust input dimensions for linear layer
+                        original_weight = layer.weight.data
+                        new_weight = original_weight @ P_tensor
                         
-    #                     # Create new linear layer with adjusted input dimensions
-    #                     new_in_features = prev_P.shape[1]
-    #                     new_layer = nn.Linear(new_in_features, layer.out_features, bias=(layer.bias is not None))
-    #                     new_layer.to(self.device)
-    #                     new_layer.weight.data = new_weight
+                        # Create new linear layer with adjusted input dimensions
+                        new_in_features = prev_P.shape[1]
+                        new_layer = nn.Linear(new_in_features, layer.out_features, bias=(layer.bias is not None))
+                        new_layer.to(self.device)
+                        new_layer.weight.data = new_weight
                         
-    #                     if layer.bias is not None:
-    #                         new_layer.bias.data = layer.bias.data.clone()
+                        if layer.bias is not None:
+                            new_layer.bias.data = layer.bias.data.clone()
                         
-    #                     # Replace the layer
-    #                     setattr(parent, attr_name, new_layer)
-    #                     layer = new_layer
+                        # Replace the layer
+                        setattr(parent, attr_name, new_layer)
+                        layer = new_layer
                 
-    #             # Compress the current layer if it's not the output layer
-    #             # Now we compress all layers except the output layer
-    #             if name != output_layer_name:
-    #                 compressed_layer, P = self.compress_layer(layer)
-    #                 setattr(parent, attr_name, compressed_layer)
+                # Compress the current layer if it's not the output layer
+                # Now we compress all layers except the output layer
+                if name != output_layer_name:
+                    compressed_layer, P = self.compress_layer(layer)
+                    setattr(parent, attr_name, compressed_layer)
                     
-    #                 # Store the association matrix for the next layer
-    #                 prev_P = P
-    #                 self.association_matrices[name] = P
-    #                 print(f"Compressed layer {name}: {layer} -> {compressed_layer}")
-    #             else:
-    #                 # Reset prev_P for non-compressible layers
-    #                 prev_P = None
-    #                 print(f"Skipped layer {name} (output layer)")
+                    # Store the association matrix for the next layer
+                    prev_P = P
+                    self.association_matrices[name] = P
+                    print(f"Compressed layer {name}: {layer} -> {compressed_layer}")
+                else:
+                    # Reset prev_P for non-compressible layers
+                    prev_P = None
+                    print(f"Skipped layer {name} (output layer)")
 
-    #      # Store compressed parameters and stats
-    #     self.compressed_params = {name: param.data.clone() for name, param in compressed_model.named_parameters()}
-    #     self.calculate_compression_stats()
+         # Store compressed parameters and stats
+        self.compressed_params = {name: param.data.clone() for name, param in compressed_model.named_parameters()}
+        self.calculate_compression_stats()
         
-    #     # Store the compressed model
-    #     self.compressed_model = compressed_model
+        # Store the compressed model
+        self.compressed_model = compressed_model
         
-    #     # Return the compressed model
-    #     return compressed_model
+        # Return the compressed model
+        return compressed_model
 
 
     def compress_model(self):
@@ -569,7 +574,7 @@ class NeuralNetworkCompressor:
     
         # Iterate through the layers in overlapping pairs, e.g., (L0, L2), then (L2, L4)
         # We stop before the last layer, as it cannot be a "current_layer" with a "next_layer".
-        for i in range(1,len(compressible_layer_names) - 1):
+        for i in range(1,len(compressible_layer_names) - 2):
         # for i in range(1,2):
             current_layer_name = compressible_layer_names[i]
             next_layer_name = compressible_layer_names[i+1]

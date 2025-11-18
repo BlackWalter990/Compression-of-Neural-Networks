@@ -59,7 +59,7 @@ class NeuralNetworkCompressor:
         # Try to move model to device with error handling
         try:
             self.model.to(self.device)
-            print("Model successfully moved to device.")
+            print("Model successfully moved to device.\n")
         except Exception as e:
             print(f"Error moving model to device: {e}")
             print("Falling back to CPU.")
@@ -90,13 +90,14 @@ class NeuralNetworkCompressor:
         D = X_sum_sq + Y_sum_sq - 2 * X @ Y.T
         return D
     
-    def run_deterministic_annealing(self, X, K):
+    def run_deterministic_annealing(self, X, K, alpha_matrix=None):
         """
         Run deterministic annealing clustering algorithm on GPU.
         
         Args:
             X (np.ndarray): Data matrix of shape (M, N)
             K (int): Number of clusters
+            alpha_matrix (np.ndarray, optional): Constraint matrix to forbid certain associations.
             
         Returns:
             tuple: (centroids Y, association matrix P)
@@ -106,10 +107,15 @@ class NeuralNetworkCompressor:
         # Convert to PyTorch tensor and move to device
         try:
             X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
+            if alpha_matrix is not None:
+                alpha_tensor = torch.tensor(alpha_matrix, dtype=torch.float32, device=self.device)
         except Exception as e:
             print(f"Error creating tensor on device: {e}")
             print("Falling back to CPU for this operation.")
             X_tensor = torch.tensor(X, dtype=torch.float32, device='cpu')
+            if alpha_matrix is not None:
+                alpha_tensor = torch.tensor(alpha_matrix, dtype=torch.float32, device='cpu')
+
         
         # Px is the weight for each data point, assuming uniform weights
         Px = torch.full((M, 1), 1 / M, device=X_tensor.device)
@@ -128,7 +134,14 @@ class NeuralNetworkCompressor:
                 # Calculate probability matrix using softmax
                 D_bar = D - torch.min(D, dim=1, keepdim=True).values
                 num = torch.exp(-D_bar / T)
+
+                if alpha_matrix is not None:
+                    # Apply the constraints by element-wise multiplication
+                    num = num * alpha_tensor
+                
                 den = torch.sum(num, dim=1, keepdim=True)
+                # Add a small epsilon to prevent division by zero if a row in num is all zeros
+                den[den == 0] = 1e-10
                 P = num / den
                 
                 # Update centroids
@@ -294,313 +307,245 @@ class NeuralNetworkCompressor:
         return compressed_layer, P
     
 
-    def _compress_holistically(self, current_layer, next_layer):
+    def create_alpha_mat(self, layer_sizes, M):
         """
-        (Private Helper) Compresses a hidden layer by clustering a representation 
-        of its neurons that includes both incoming and outgoing weights.
-        Also measures the distortion.
-        """
-        print(f"--- Starting Holistic Compression on {current_layer} and {next_layer} ---")
-        device = current_layer.weight.device
-        dtype = current_layer.weight.dtype
+        Creates a constraint matrix to prevent input and output neurons from being aggregated.
         
-        # 1. IDENTIFY WEIGHTS
-        W1 = current_layer.weight.data.cpu().numpy()
-        b1 = current_layer.bias.data.cpu().numpy()
-        W2 = next_layer.weight.data.cpu().numpy()
-        
-        # print(W2)
-        # print()
-        # print(b1)
-        # print()
-     
-        # 2. COMBINE MATRICES
-        W2_T = W2.T
-        # print("W2")
-        # print(W2_T)
-        # print()
-        
-        augmented_W1 = np.hstack([W1, b1.reshape(-1, 1)])
-        combined_matrix = np.concatenate([augmented_W1, W2_T], axis=1)
-        print(f"Created combined matrix of shape: {combined_matrix.shape}")
-    
-        # 3. AGGREGATE
-        num_neurons = combined_matrix.shape[0]
-        K = max(1, int(num_neurons * self.compression_ratio))
-        centroids, P = self.run_deterministic_annealing(combined_matrix, K)
-        print(f"Aggregated into {K} centroids.")
-
-        P_T = P.T
-        # print("\n",P_T)
-        
-        # 5. SEPARATE (Done before distortion measurement to get new weights)
-        new_aug_w1 = centroids[:, :augmented_W1.shape[1]]
-        # new_w2_t = centroids[:, augmented_W1.shape[1]:]
-        # new_w1 = new_aug_w1[:, :-1]
-        new_b1 = new_aug_w1[:, -1]
-        # new_w2 = new_w2_t.T
-
-
-        # Original Weights multiplied by the association matrix
-        p_sum = np.sum(P_T, axis = 1)
-        p_sum = p_sum.reshape(-1,1)
-        # print(p_sum)
-        # print()
-
-        print(P_T.shape)
-        print(b1.shape)
-        
-        W1_M_P = ((P_T)@W1)/p_sum
-        b1_M_P = (P_T@b1)/p_sum
-        W2_M_P = (P_T@W2_T)/p_sum
-        W2_M_P = W2_M_P.T
-
-        new_w1 = W1_M_P
-        # new_b1 = b1_M_P
-        new_w2 = W2_M_P
-        
-        # print(new_w1)
-        # print()
-        # print("W2_M_P")
-        # print(W2_M_P)
-        # print()
-        # print(new_b1)
-        # print()
-        # print(b1_M_P)
-        # print("new_w2")
-        # print(new_w2)
-        # print()
-
-        # 4. MEASURE DISTORTION (now compares original vs reconstructed weights)
-        P_tensor = torch.tensor(P, device=device, dtype=dtype)
-        
-        # Reconstruct the original weight matrices from the new compressed ones
-        new_w1_tensor = torch.tensor(new_w1, device=device, dtype=dtype)
-        W1_recon_tensor = P_tensor @ new_w1_tensor
-
-        print(W1_recon_tensor.shape)
-        print(P_tensor.shape)
-        print(W1.shape)
-        
-        # print()
-        
-        new_w2_tensor = torch.tensor(new_w2, device=device, dtype=dtype)
-        # Note: The reconstruction for W2 uses P.T
-        W2_recon_tensor = new_w2_tensor @ P_tensor.T
-        
-        # Original weight tensors
-        W1_tensor = torch.tensor(W1, device=device, dtype=dtype)
-        W2_tensor = torch.tensor(W2, device=device, dtype=dtype)
-        
-        # Calculate dissimilarity using the provided function.
-        # The diagonal of the resulting distance matrix gives the squared distance
-        # between corresponding original and reconstructed neuron weights.
-        D1_matrix = self.calculate_distortion(W1_tensor, W1_recon_tensor)
-        dissimilarity_W1 = torch.sum(torch.diag(D1_matrix))
-        
-        D2_matrix = self.calculate_distortion(W2_tensor, W2_recon_tensor)
-        dissimilarity_W2 = torch.sum(torch.diag(D2_matrix))
-        
-        print(f"Dissimilarity for W1 (incoming weights): {dissimilarity_W1.item():.4f}")
-        print(f"Dissimilarity for W2 (outgoing weights): {dissimilarity_W2.item():.4f}")
-    
-        # 6. CREATE NEW LAYERS
-        new_current_layer = nn.Linear(in_features=new_w1.shape[1], out_features=new_w1.shape[0], bias=True)
-        new_current_layer.to(device)
-        new_current_layer.weight.data = torch.tensor(new_w1, device=device, dtype=dtype)
-        new_current_layer.bias.data = torch.tensor(new_b1, device=device, dtype=dtype)
-        
-        new_next_layer = nn.Linear(in_features=new_w2.shape[1], out_features=new_w2.shape[0], bias=(next_layer.bias is not None))
-        new_next_layer.to(device)
-        new_next_layer.weight.data = torch.tensor(new_w2, device=device, dtype=dtype)
-        if new_next_layer.bias is not None:
-            new_next_layer.bias.data = next_layer.bias.data.clone()
+        Args:
+            layer_sizes (list): List of neuron counts for each layer [in, h1, h2, ..., out].
+            M (int): The total number of supernodes in the compressed graph.
             
-        print("--- Holistic Compression Complete ---")
-        return new_current_layer, new_next_layer, P
-
-    
-    def compress_model_old(self):
+        Returns:
+            np.ndarray: The (N, M) alpha constraint matrix.
         """
-        Compress the entire neural network model, adjusting subsequent layers.
-        Now compresses all hidden layers including the first one (fc1),
-        while not compressing the input layer and output layer.
+        N = sum(layer_sizes)
+        n_input = layer_sizes[0]
+        n_output = layer_sizes[-1]
+
+
+        alpha = np.ones((N, M))
+
+        # Constraint 1: Input neurons can only map to their corresponding input supernode.
+        # This assumes the first n_input supernodes correspond to the n_input input neurons.
+        for i in range(n_input):
+            alpha[i, :] = 0
+            alpha[i, i] = 1
+        # Constraint 2: Output neurons can only map to their corresponding output supernode.
+        # This assumes the last n_output supernodes correspond to the n_output output neurons.
+        for i in range(n_output):
+            original_idx = i + (N - n_output)
+            supernode_idx = i + (M - n_output)
+            alpha[original_idx, :] = 0
+            alpha[original_idx, supernode_idx] = 1
+
+        # Constraint 3: Hidden neurons can only map to hidden supernodes.
+        hidden_neuron_indices = range(n_input, N - n_output)
+        input_supernode_indices = range(n_input)
+        output_supernode_indices = range(M - n_output, M)
+        
+        for i in hidden_neuron_indices:
+            # Prevent mapping to input supernodes
+            alpha[i, input_supernode_indices] = 0
+            # Prevent mapping to output supernodes
+            alpha[i, output_supernode_indices] = 0
+            
+        return alpha
+
+    def create_adjacency_matrix(self):
         """
-        compressed_model = deepcopy(self.model)
-        
-        # Try to move compressed model to device with error handling
-        try:
-            compressed_model.to(self.device)
-            print("Model successfully moved to device and Compressing...")
-        except Exception as e:
-            print(f"Error moving compressed model to device: {e}")
-            print("Falling back to CPU.")
-            self.device = torch.device("cpu")
-            compressed_model.to(self.device)
-            self.model.to(self.device)
-        
-        self.association_matrices = {}
-        prev_P = None
-        prev_layer_name = None
+        Creates a global adjacency matrix for the entire feed-forward network.
+        Also returns detailed information about each original linear layer.
+        """
+        linear_layers = [module for module in self.model.modules() if isinstance(module, nn.Linear)]
+        if not linear_layers:
+            return np.array([]), [], []
 
+        # Create a list of layer sizes [input_dim, hidden1_dim, ..., output_dim]
+        layer_sizes = [linear_layers[0].in_features] + [layer.out_features for layer in linear_layers]
+        total_neurons = sum(layer_sizes)
         
-        # Get a list of all modules in the model
-        modules = list(compressed_model.named_modules())
+        # Calculate the starting index (offset) for each layer in the matrix
+        offsets = np.cumsum([0] + layer_sizes[:-1])
 
-        # First pass: identify compressible layers
-        # Collect all linear and conv layers
-        linear_conv_layers = []
-        for name, module in modules:
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                linear_conv_layers.append((name, module))
+        # Initialize the giant adjacency matrix with zeros
+        X = np.zeros((total_neurons, total_neurons))
+
+        # Store original layer details for reconstruction
+        original_layer_info = []
         
-        # The first layer is the input layer, the last layer is the output layer
-        input_layer_name = linear_conv_layers[0][0]
-        output_layer_name = linear_conv_layers[-1][0]
+        # Populate the matrix with weights from each layer
+        for i, layer in enumerate(linear_layers):
+            W = layer.weight.data.cpu().numpy()  # Shape: (out_features, in_features)
+            b = layer.bias.data.cpu().numpy() if layer.bias is not None else None
+            
+            offset_in = offsets[i]
+            offset_out = offsets[i+1]
+            
+            in_features = layer_sizes[i]
+            out_features = layer_sizes[i+1]
+
+            # Place the transposed weight matrix into the correct block of X.
+            X[offset_in : offset_in + in_features, offset_out : offset_out + out_features] = W.T
+            
+            # Store info for reconstruction
+            original_layer_info.append({
+                'module': layer,
+                'original_in_features': in_features,
+                'original_out_features': out_features,
+                'original_bias_data': b,
+                'original_src_global_indices': list(range(offset_in, offset_in + in_features)),
+                'original_dest_global_indices': list(range(offset_out, offset_out + out_features))
+            })
+            
+        return X, layer_sizes, original_layer_info
+
+    def reconstruct_compressed_model(self, X_compressed, P, original_layer_info, original_layer_sizes, M):
+        """
+        Reconstructs a new nn.Sequential model from the compressed global adjacency matrix and partition matrix.
+        """
+        compressed_layers = nn.ModuleList()
+        print(f"compressed_layers: {type(compressed_layers)}")
+        # Determine new layer sizes and offsets
+        new_layer_sizes = [original_layer_sizes[0]] # Input layer size
+        for i in range(1, len(original_layer_sizes) - 1): # Hidden layers
+            new_layer_sizes.append(max(1, int(original_layer_sizes[i] * self.compression_ratio)))
+        new_layer_sizes.append(original_layer_sizes[-1]) # Output layer size
         
-        print(f"Input layer: {input_layer_name}")
-        print(f"Output layer: {output_layer_name}")
+        new_offsets = np.cumsum([0] + new_layer_sizes[:-1])
         
-        # Second pass: compress layers and adjust dimensions
-        for name, module in modules:
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                # Get parent module and attribute name
-                path = name.split('.')
-                parent = compressed_model
-                for p in path[:-1]:
-                    parent = getattr(parent, p)
-                attr_name = path[-1]
-                layer = getattr(parent, attr_name)
-                
-                # If this layer follows a compressed layer, adjust its input dimensions
-                if prev_P is not None:
-                    # Convert P to tensor and move to device
-                    try:
-                        P_tensor = torch.tensor(prev_P, dtype=torch.float32, device=self.device)
-                    except Exception as e:
-                        print(f"Error creating P tensor on device: {e}")
-                        print("Falling back to CPU for this operation.")
-                        P_tensor = torch.tensor(prev_P, dtype=torch.float32, device='cpu')
-                    
-                    if isinstance(layer, nn.Linear):
-                        # Adjust input dimensions for linear layer
-                        original_weight = layer.weight.data
-                        new_weight = original_weight @ P_tensor
-                        
-                        # Create new linear layer with adjusted input dimensions
-                        new_in_features = prev_P.shape[1]
-                        new_layer = nn.Linear(new_in_features, layer.out_features, bias=(layer.bias is not None))
-                        new_layer.to(self.device)
-                        new_layer.weight.data = new_weight
-                        
-                        if layer.bias is not None:
-                            new_layer.bias.data = layer.bias.data.clone()
-                        
-                        # Replace the layer
-                        setattr(parent, attr_name, new_layer)
-                        layer = new_layer
-                
-                # Compress the current layer if it's not the output layer
-                # Now we compress all layers except the output layer
-                if name != output_layer_name:
-                    compressed_layer, P = self.compress_layer(layer)
-                    setattr(parent, attr_name, compressed_layer)
-                    
-                    # Store the association matrix for the next layer
-                    prev_P = P
-                    self.association_matrices[name] = P
-                    print(f"Compressed layer {name}: {layer} -> {compressed_layer}")
+        linear_layer_idx = 0
+        
+        # Determine the top-level container of the layers
+        layer_container = self.model
+        if hasattr(self.model, 'net'):
+            layer_container = self.model.net
+
+        # Helper to recursively flatten nested nn.Sequential modules
+        def flatten_modules(module):
+            flat_list = []
+            for child in module.children():
+                if isinstance(child, nn.Sequential):
+                    flat_list.extend(flatten_modules(child))
                 else:
-                    # Reset prev_P for non-compressible layers
-                    prev_P = None
-                    print(f"Skipped layer {name} (output layer)")
+                    flat_list.append(child)
+            return flat_list
 
-         # Store compressed parameters and stats
+        # Iterate over the flattened list of modules
+        modules_to_iterate = flatten_modules(layer_container)
+
+        for module in modules_to_iterate:
+            if isinstance(module, nn.Linear):
+                info = original_layer_info[linear_layer_idx]
+                
+                new_in_features = new_layer_sizes[linear_layer_idx]
+                new_out_features = new_layer_sizes[linear_layer_idx + 1]
+
+                # Extract new weights from X_compressed
+                new_offset_src = new_offsets[linear_layer_idx]
+                new_offset_dest = new_offsets[linear_layer_idx + 1]
+                
+                W_new_block = X_compressed[new_offset_src : new_offset_src + new_in_features, 
+                                           new_offset_dest : new_offset_dest + new_out_features]
+                
+                W_new_pytorch = torch.tensor(W_new_block.T, 
+                                             dtype=module.weight.dtype, 
+                                             device=self.device)
+                
+                # Calculate new biases
+                b_new_pytorch = None
+                if info['original_bias_data'] is not None:
+                    original_bias_data = info['original_bias_data']
+                    
+                    P_sub = P[info['original_dest_global_indices'], 
+                              new_offset_dest : new_offset_dest + new_out_features]
+                    
+                    sum_P_sub_cols = np.sum(P_sub, axis=0, keepdims=True)
+                    sum_P_sub_cols[sum_P_sub_cols == 0] = 1e-10
+                    
+                    b_new_numpy = (original_bias_data @ P_sub) / sum_P_sub_cols.flatten()
+                    
+                    b_new_pytorch = torch.tensor(b_new_numpy, 
+                                                 dtype=module.bias.dtype, 
+                                                 device=self.device)
+                
+                new_linear_layer = nn.Linear(new_in_features, new_out_features, bias=(b_new_pytorch is not None))
+                new_linear_layer.weight.data = W_new_pytorch
+                if b_new_pytorch is not None:
+                    new_linear_layer.bias.data = b_new_pytorch
+                
+                compressed_layers.append(new_linear_layer)
+                linear_layer_idx += 1
+            else:
+                # Add activation functions or other non-linear modules
+                compressed_layers.append(deepcopy(module))
+                
+        return nn.Sequential(*compressed_layers)
+
+    def compress_model(self):
+        """
+        New compress_model function as per user request.
+        Constructs a global adjacency matrix 'X' and a constraint matrix 'alpha'
+        to prepare for whole-network compression.
+        """
+        print("--- Starting Global Model Compression ---")
+        
+        # Step 1: Create the global adjacency matrix X and get layer sizes
+        print("Creating the global adjacency matrix (X)...")
+        X, layer_sizes, original_layer_info = self.create_adjacency_matrix()
+        
+        if X.size == 0:
+            print("No linear layers found in the model. Cannot create adjacency matrix.")
+            return deepcopy(self.model)
+
+        print(f"Global adjacency matrix X created with shape: {X.shape}")
+        
+        # Step 2: Determine dimensions for original (N) and compressed (M) graphs
+        N = X.shape[0]
+        n_input = layer_sizes[0]
+        n_output = layer_sizes[-1]
+        n_hidden = N - n_input - n_output
+
+        if n_hidden <= 0:
+            print("Model has no hidden layers to compress.")
+            return deepcopy(self.model)
+
+        n_hidden_compressed = max(1, int(n_hidden * self.compression_ratio))
+        M = n_input + n_hidden_compressed + n_output
+        print(f"Network will be compressed from {N} to {M} total effective neurons.")
+
+        # Step 3: Create the alpha constraint matrix
+        print("Creating the alpha constraint matrix...")
+        alpha_matrix = self.create_alpha_mat(layer_sizes, M)
+        print(f"Alpha constraint matrix created with shape: {alpha_matrix.shape}")
+
+        # Step 4: Run Deterministic Annealing on the global matrix
+        print("Running Deterministic Annealing on the global adjacency matrix...")
+        # Note: The data to be clustered are the rows of X, representing the outgoing weights of each neuron
+        centroids, P = self.run_deterministic_annealing(X, M, alpha_matrix=alpha_matrix)
+        print(f"DA complete. Partition matrix P has shape: {P.shape}")
+        # print(np.round(P, 3))
+        # print(np.round(centroids,5))
+        # print("Y")
+        # print(np.round(Y,5))
+
+        # Step 5: Calculate the compressed global adjacency matrix
+        X_compressed = centroids @ P
+        print(f"Compressed global adjacency matrix X_compressed created with shape: {X_compressed.shape}")
+
+        # Step 6: Reconstruct the compressed model
+        print("Reconstructing the compressed model...")
+        compressed_model = self.reconstruct_compressed_model(X_compressed, P, original_layer_info, layer_sizes, M)
+        print("Compressed model reconstructed.")
+        
+        # Store compressed parameters and stats
         self.compressed_params = {name: param.data.clone() for name, param in compressed_model.named_parameters()}
         self.calculate_compression_stats()
         
         # Store the compressed model
         self.compressed_model = compressed_model
         
-        # Return the compressed model
-        return compressed_model
-
-
-    def compress_model(self):
-        """
-        Compresses the entire model by iteratively applying the holistic, 
-        two-layer compression strategy.
-        """
-        compressed_model = deepcopy(self.model)
-        
-        # Helper functions to get/set modules by their string name (e.g., 'net.0')
-        def get_module_by_name(model, name):
-            path = name.split('.')
-            module = model
-            for p in path:
-                # Check for Sequential indexing
-                if p.isdigit():
-                    module = module[int(p)]
-                else:
-                    module = getattr(module, p)
-            return module
-    
-        def set_module_by_name(model, name, new_module):
-            path = name.split('.')
-            parent = model
-            for p in path[:-1]:
-                if p.isdigit():
-                    parent = parent[int(p)]
-                else:
-                    parent = getattr(parent, p)
-            
-            attr_name = path[-1]
-            if attr_name.isdigit():
-                parent[int(attr_name)] = new_module
-            else:
-                setattr(parent, attr_name, new_module)
-    
-        # Get a list of the names of all compressible layers
-        compressible_layer_names = []
-        for name, module in compressed_model.named_modules():
-            if isinstance(module, nn.Linear):
-                compressible_layer_names.append(name)
-        
-        if len(compressible_layer_names) < 2:
-            print("Not enough compressible layers to apply holistic compression.")
-            return compressed_model
-    
-        print(f"Found compressible layers: {compressible_layer_names}")
-    
-        # Iterate through the layers in overlapping pairs, e.g., (L0, L2), then (L2, L4)
-        # We stop before the last layer, as it cannot be a "current_layer" with a "next_layer".
-        for i in range(1,len(compressible_layer_names) - 2):
-        # for i in range(1,2):
-            current_layer_name = compressible_layer_names[i]
-            next_layer_name = compressible_layer_names[i+1]
-            
-            print(f"\nProcessing pair: ({current_layer_name}, {next_layer_name})")
-            
-            # Get the actual layer modules from the potentially modified compressed_model
-            current_layer = get_module_by_name(compressed_model, current_layer_name)
-            next_layer = get_module_by_name(compressed_model, next_layer_name)
-    
-            # Perform the holistic compression on the current pair
-            new_current_layer, new_next_layer, P = self._compress_holistically(current_layer, next_layer)
-            
-            # Replace these two layers in the compressed_model
-            set_module_by_name(compressed_model, current_layer_name, new_current_layer)
-            set_module_by_name(compressed_model, next_layer_name, new_next_layer)
-            
-            self.association_matrices[current_layer_name] = P
-            print(f"Updated layers '{current_layer_name}' and '{next_layer_name}' in the model.")
-    
-        # Store final model details
-        print("\nModel compression complete.")
-        self.compressed_params = {name: param.data.clone() for name, param in compressed_model.named_parameters()}
-        self.calculate_compression_stats()
-        self.compressed_model = compressed_model
-        
+        if isinstance(compressed_model, tuple):
+            return compressed_model[0]
         return compressed_model
 
     
@@ -619,50 +564,66 @@ class NeuralNetworkCompressor:
             'parameter_reduction': original_params - compressed_params
         }
     
-    def evaluate_model(self, model, test_loader):
+    def evaluate_model(self, model, test_loader, criterion, metric_fn=None):
         """
         Evaluate the model on a test dataset using GPU.
         
         Args:
             model: PyTorch model to evaluate
             test_loader: DataLoader for test dataset
+            criterion: Loss function (e.g., nn.MSELoss, nn.CrossEntropyLoss)
+            metric_fn: Optional function to calculate an additional metric (e.g., accuracy, r2_score).
+                       It should accept (predictions, targets) and return a scalar.
             
         Returns:
-            dict: Dictionary containing evaluation metrics
+            dict: Dictionary containing evaluation metrics (loss and optionally the custom metric)
         """
         model.eval()
         model.to(self.device)
         
         total_loss = 0.0
-        total_samples = 0
-        criterion = nn.MSELoss().to(self.device)  # Use MSE for regression
+        all_targets = []
+        all_predictions = []
         
         with torch.no_grad():
             for inputs, targets in test_loader:
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 outputs = model(inputs)
+                
                 loss = criterion(outputs, targets).item() * inputs.size(0)
                 total_loss += loss
-                total_samples += inputs.size(0)
+                
+                all_targets.append(targets.cpu().numpy())
+                all_predictions.append(outputs.cpu().numpy())
         
-        avg_loss = total_loss / total_samples
+        avg_loss = total_loss / len(test_loader.dataset)
         
-        return {
-            'loss': avg_loss
-        }
+        results = {'loss': avg_loss}
+        
+        if metric_fn is not None:
+            all_targets = np.concatenate(all_targets)
+            all_predictions = np.concatenate(all_predictions)
+            metric_value = metric_fn(all_predictions, all_targets)
+            results['metric'] = metric_value # Using a generic name 'metric'
+            
+        return results
     
-    def compare_models(self, test_loader):
+    def compare_models(self, test_loader, criterion, metric_fn=None, metric_name='metric'):
         """
         Compare the original and compressed models on a test dataset using GPU.
         
         Args:
             test_loader: DataLoader for test dataset
+            criterion: Loss function (e.g., nn.MSELoss, nn.CrossEntropyLoss)
+            metric_fn: Optional function to calculate an additional metric (e.g., accuracy, r2_score).
+                       It should accept (predictions, targets) and return a scalar.
+            metric_name: Name for the custom metric in the results dictionary (e.g., 'accuracy', 'r2_score').
             
         Returns:
             dict: Dictionary containing comparison metrics
         """
         # Evaluate original model
-        original_results = self.evaluate_model(self.model, test_loader)
+        original_results = self.evaluate_model(self.model, test_loader, criterion, metric_fn)
         
         # Evaluate compressed model
         if self.compressed_model is None:
@@ -670,67 +631,60 @@ class NeuralNetworkCompressor:
         else:
             compressed_model = self.compressed_model
             
-        compressed_results = self.evaluate_model(compressed_model, test_loader)
+        compressed_results = self.evaluate_model(compressed_model, test_loader, criterion, metric_fn)
         
         # Calculate differences
         loss_diff = compressed_results['loss'] - original_results['loss']
         
-        return {
+        comparison_results = {
             'original_loss': original_results['loss'],
             'compressed_loss': compressed_results['loss'],
             'loss_difference': loss_diff,
             **self.compression_stats
         }
+
+        if metric_fn is not None:
+            comparison_results[f'original_{metric_name}'] = original_results['metric']
+            comparison_results[f'compressed_{metric_name}'] = compressed_results['metric']
+            comparison_results[f'{metric_name}_difference'] = compressed_results['metric'] - original_results['metric']
+            
+        return comparison_results
     
-    def visualize_compression(self, layer_name=None):
+    def visualize_compression(self):
         """
-        Visualize the compression of a specific layer or the entire model.
+        Visualize the overall compression statistics.
+        """
+        # Visualize compression statistics
+        stats = self.compression_stats
+        if not stats:
+            print("Compression statistics not available. Run compress_model() first.")
+            return
+
+        plt.figure(figsize=(12, 5))
         
-        Args:
-            layer_name: Name of the layer to visualize (if None, visualize all layers)
-        """
-        if layer_name:
-            # Visualize a specific layer
-            if layer_name in self.original_params and layer_name in self.compressed_params:
-                original_weights = self.original_params[layer_name].cpu().numpy()
-                compressed_weights = self.compressed_params[layer_name].cpu().numpy()
-                
-                plt.figure(figsize=(12, 6))
-                
-                plt.subplot(1, 2, 1)
-                plt.imshow(original_weights, cmap='viridis')
-                plt.title(f'Original Weights - {layer_name}')
-                plt.colorbar()
-                
-                plt.subplot(1, 2, 2)
-                plt.imshow(compressed_weights, cmap='viridis')
-                plt.title(f'Compressed Weights - {layer_name}')
-                plt.colorbar()
-                
-                plt.tight_layout()
-                plt.show()
-            else:
-                print(f"Layer {layer_name} not found in model parameters.")
-        else:
-            # Visualize compression statistics
-            stats = self.compression_stats
-            if stats:
-                plt.figure(figsize=(10, 6))
-                
-                plt.subplot(1, 2, 1)
-                categories = ['Original', 'Compressed']
-                values = [stats['original_parameters'], stats['compressed_parameters']]
-                plt.bar(categories, values)
-                plt.title('Parameter Count')
-                plt.ylabel('Number of Parameters')
-                
-                plt.subplot(1, 2, 2)
-                plt.pie([stats['compression_ratio'], 1 - stats['compression_ratio']], 
-                        labels=['Compressed', 'Remaining'], autopct='%1.1f%%')
-                plt.title('Compression Ratio')
-                
-                plt.tight_layout()
-                plt.show()
+        plt.subplot(1, 2, 1)
+        categories = ['Original', 'Compressed']
+        values = [stats['original_parameters'], stats['compressed_parameters']]
+        bars = plt.bar(categories, values, color=['#1f77b4', '#ff7f0e'])
+        plt.title('Parameter Count Comparison')
+        plt.ylabel('Number of Parameters')
+        for bar in bars:
+            yval = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2.0, yval, f'{yval:,}', va='bottom', ha='center')
+
+        plt.subplot(1, 2, 2)
+        if stats['original_parameters'] > 0:
+            compression_pct = stats['compression_ratio'] * 100
+            remaining_pct = 100 - compression_pct
+            plt.pie([compression_pct, remaining_pct], 
+                    labels=['Reduction', 'Remaining'], 
+                    autopct='%1.1f%%', 
+                    startangle=90,
+                    colors=['#d62728', '#2ca02c'])
+            plt.title('Parameter Reduction Ratio')
+        
+        plt.tight_layout()
+        plt.show()
     
 
     def model_to_graph(self, model):
@@ -1156,12 +1110,12 @@ class SingleNN(nn.Module):
 criterion  = nn.MSELoss()
 
 
-df = pd.read_csv("/kaggle/input/single-layer-models/F1_data.csv", header = None)
+df = pd.read_csv("/Users/aryandangi/Library/Mobile Documents/com~apple~CloudDocs/Inventory/Work Portfolio/IIT/Courses/CS/BTP/Compression-of-Neural-Networks/Codes/Data/x_Cube_no_noise.csv", header = None)
 df = df.drop(index = 0)
 df = df.astype(float)
 
-y = torch.tensor(df.iloc[0:, 3].values, dtype = torch.float).unsqueeze(1)
-X = torch.tensor(df.iloc[:,0:3].values, dtype = torch.float)
+y = torch.tensor(df.iloc[0:, 1].values, dtype = torch.float).unsqueeze(1)
+X = torch.tensor(df.iloc[:,0:1].values, dtype = torch.float)
 
 X_train, X_val, y_train, y_val = train_test_split(X,y, test_size = 0.2, random_state = 42)
 
@@ -1194,19 +1148,55 @@ print(f"Using device: {device}")
 
 # Load the saved weights
 try:
-    model = torch.load("/kaggle/input/single-layer-models/F1_model_full.pth",map_location=device, weights_only = False)
+    model = torch.load("/Users/aryandangi/Library/Mobile Documents/com~apple~CloudDocs/Inventory/Work Portfolio/IIT/Courses/CS/BTP/Compression-of-Neural-Networks/Codes/Models /x_Cube_no_noise.pth",map_location=device, weights_only = False)
     print("Model loaded.")
 except Exception as e:
     print("Error loading:", e)
 
+def eval_classification(model, loader):
+    model.eval()
+    correct = 0
+    total = 0
 
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            preds = model(x)
+            predicted = preds.argmax(dim=1)
+            correct += (predicted == y).sum().item()
+            total += y.size(0)
+
+    return correct / total
+
+def eval_regression(model, loader):
+    model.eval()
+    original_val_loss = 0.0
+    original_all_targets = []
+    original_all_predictions = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            preds = model(xb)
+            original_val_loss += criterion(preds,yb).item() * xb.size(0)
+            original_all_targets.append(yb.cpu().numpy())
+            original_all_predictions.append(preds.cpu().numpy())
+    
+    original_avg_loss = original_val_loss / len(test_loader.dataset)
+    original_all_targets = np.concatenate(original_all_targets)
+    original_all_predictions = np.concatenate(original_all_predictions)
+    original_r2 = r2_score(original_all_targets, original_all_predictions)
+    
+    print(f'\nOriginal Model loss: {original_avg_loss:.5f}')
+    print(f'Original Model R2 Score: {original_r2:.5f}')
+
+    return original_avg_loss, original_r2
 
 # Test Script
-# CRs = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+CRs = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 # pert = [0.0005, 0.001, 0.005, 0.01]
 
-CRs = [0.5]
-pert = [0.0005,0.001]
+# CRs = [0.9,0.7,0.6]
+pert = [0.0005]
 
 results_df = pd.DataFrame(columns=[
      'Comp ratio',
@@ -1234,25 +1224,7 @@ for ratio in CRs:
 
             
         # Evaluate original model
-        model.eval()
-        original_val_loss = 0.0
-        original_all_targets = []
-        original_all_predictions = []
-        with torch.no_grad():
-            for xb, yb in test_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                preds = model(xb)
-                original_val_loss += criterion(preds,yb).item() * xb.size(0)
-                original_all_targets.append(yb.cpu().numpy())
-                original_all_predictions.append(preds.cpu().numpy())
-        
-        original_avg_loss = original_val_loss / len(test_loader.dataset)
-        original_all_targets = np.concatenate(original_all_targets)
-        original_all_predictions = np.concatenate(original_all_predictions)
-        original_r2 = r2_score(original_all_targets, original_all_predictions)
-
-        print(f'\nOriginal Model loss: {original_avg_loss:.5f}')
-        print(f'Original Model R2 Score: {original_r2:.5f}')
+        eval_regression(model,test_loader)
         
         # for name, param in model.named_parameters():
         #     if "weight" in name:
@@ -1261,14 +1233,14 @@ for ratio in CRs:
         
         # Create compressor with CUDA support
         try:
-            compressor = NeuralNetworkCompressor(model, test_loader=test_loader, T = 80, PERTURB = perturb,  compression_ratio=ratio, device=device)
+            compressor = NeuralNetworkCompressor(model, T = 80, PERTURB = perturb,  compression_ratio=ratio, device=device)
 
         except Exception as e:
             print(f"Error creating compressor: {e}")
             traceback.print_exc()
             # If CUDA fails, try with CPU
             device = torch.device("cpu")
-            compressor = NeuralNetworkCompressor(model, test_loader=test_loader, T = 80, PERTURB = perturb,  compression_ratio=ratio, device=device)
+            compressor = NeuralNetworkCompressor(model, T = 80, PERTURB = perturb,  compression_ratio=ratio, device=device)
         
         # Compress the model
         try:
@@ -1288,29 +1260,8 @@ for ratio in CRs:
         duration = end_time - start_time
 
         # Evaluate the compressed model
-        compressed_model.eval()
-        comp_val_loss = 0
-
-        comp_all_targets = []
-        comp_all_predictions = []
+        final_loss, comp_r2 = eval_regression(compressed_model,test_loader)
         
-        with torch.no_grad():
-            for xb, yb in test_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                preds = compressed_model(xb)
-                comp_val_loss += criterion(preds,yb).item() * xb.size(0)
-                comp_all_targets.append(yb.cpu().numpy())
-                comp_all_predictions.append(preds.cpu().numpy())
-        
-        comp_avg_loss = comp_val_loss / len(test_loader.dataset)
-        comp_all_targets = np.concatenate(comp_all_targets)
-        comp_all_predictions = np.concatenate(comp_all_predictions)
-        comp_r2 = r2_score(comp_all_targets, comp_all_predictions)
-
-        print(f'\nCompressed Model loss: {comp_avg_loss:.5f}')
-        print(f'Compressed Model R2 Score: {comp_r2:.5f}')
-        
-        final_loss = comp_avg_loss
         
         # Compare models
         # try:
@@ -1322,8 +1273,8 @@ for ratio in CRs:
         #     print(f"Error during model comparison: {e}")
         #     traceback.print_exc()
         
-        compressor.visualize_trained_network(model)
-        compressor.visualize_trained_network(compressed_model)
+        # compressor.visualize_trained_network(model)
+        # compressor.visualize_trained_network(compressed_model)
         # Visualize compression with optimized edge sampling
         # try:
         #     # For large graphs, use a smaller percentage of edges

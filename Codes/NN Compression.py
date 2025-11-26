@@ -307,36 +307,45 @@ class NeuralNetworkCompressor:
         return compressed_layer, P
     
 
-    def create_alpha_mat(self, layer_sizes, M):
+    def create_alpha_mat(self, ori_layer_sizes, M):
         """
         Creates a constraint matrix to prevent input and output neurons from being aggregated.
         
         Args:
-            layer_sizes (list): List of neuron counts for each layer [in, h1, h2, ..., out].
+            ori_layer_sizes (list): List of neuron counts for each layer [in, h1, h2, ..., out].
             M (int): The total number of supernodes in the compressed graph.
             
         Returns:
             np.ndarray: The (N, M) alpha constraint matrix.
         """
-        N = sum(layer_sizes)
-        n_input = layer_sizes[0]
-        n_output = layer_sizes[-1]
+        N = sum(ori_layer_sizes)
+        n_input = ori_layer_sizes[0]
+        n_output = ori_layer_sizes[-1]
 
-
-        alpha = np.ones((N, M))
+        comp_layer_sizes = [ori_layer_sizes[0]] # Input layer size
+        for i in range(1, len(ori_layer_sizes) - 1): # Hidden layers
+            comp_layer_sizes.append(max(1, int(ori_layer_sizes[i] * self.compression_ratio)))
+        comp_layer_sizes.append(ori_layer_sizes[-1]) # Output layer size
+        
+        offsets_rows = np.cumsum([0]+ori_layer_sizes[:-1])
+        offsets_cols = np.cumsum([0]+comp_layer_sizes[:-1])
+        alpha = np.zeros((N, M))
 
         # Constraint 1: Input neurons can only map to their corresponding input supernode.
         # This assumes the first n_input supernodes correspond to the n_input input neurons.
         for i in range(n_input):
-            alpha[i, :] = 0
             alpha[i, i] = 1
+        
+        for i in range(n_output):
+            alpha[offsets_rows[-1]+i, offsets_cols[-1]+i] = 1
         # Constraint 2: Output neurons can only map to their corresponding output supernode.
         # This assumes the last n_output supernodes correspond to the n_output output neurons.
-        for i in range(n_output):
-            original_idx = i + (N - n_output)
-            supernode_idx = i + (M - n_output)
-            alpha[original_idx, :] = 0
-            alpha[original_idx, supernode_idx] = 1
+        for i in range(1,len(ori_layer_sizes)-1):
+            row_start_idx = offsets_rows[i]
+            row_end_idx = offsets_rows[i+1]
+            col_start_idx = offsets_cols[i]
+            col_end_idx = offsets_cols[i+1]
+            alpha[row_start_idx:row_end_idx, col_start_idx:col_end_idx] = np.ones((ori_layer_sizes[i],comp_layer_sizes[i]))
 
         # Constraint 3: Hidden neurons can only map to hidden supernodes.
         hidden_neuron_indices = range(n_input, N - n_output)
@@ -399,12 +408,42 @@ class NeuralNetworkCompressor:
             
         return X, layer_sizes, original_layer_info
 
-    def reconstruct_compressed_model(self, X_compressed, P, original_layer_info, original_layer_sizes, M):
+    def rearrange_Y_matrix(self, Y, P, original_layer_sizes):
+        """
+        Rearrange the matrix Y to follow the sequential arrangement format for the reconstruction of the network
+        """
+        # Calculate the starting index (offset) for each layer in the matrix
+        offsets = np.cumsum([0] + original_layer_sizes[:-1])
+        num_layers = len(original_layer_sizes)-2
+        #Iterate for each layer
+        for i in range(1,1+num_layers):
+            # Pick the indices of the supernode those represents the hidden layer
+            start_offset = offsets[i]
+            end_offset = offsets[i+1]
+            sub_P = P[start_offset:end_offset]
+            col_P_sum = sub_P.sum(axis = 0)
+            curr_layer_agg = np.where(col_P_sum > 0.0099)[0]
+
+            # Get new indices of the columns and the rows
+            all_cols = np.arange(Y.shape[1])
+            fixed = all_cols[all_cols < start_offset]
+            remaining = all_cols[all_cols >= start_offset]
+            special = np.array([k for k in curr_layer_agg if k in remaining])
+            others = np.array([k for k in remaining if k not in special])
+            new_order = np.concatenate([fixed, special, others]).astype(int)
+
+            #Rearrange the columns and the rows 
+            Y = Y[:, new_order]
+            Y = Y[new_order, :]
+
+        return Y
+
+    def reconstruct_compressed_model(self, Y, P, original_layer_info, original_layer_sizes, M):
         """
         Reconstructs a new nn.Sequential model from the compressed global adjacency matrix and partition matrix.
         """
         compressed_layers = nn.ModuleList()
-        print(f"compressed_layers: {type(compressed_layers)}")
+        # print(f"compressed_layers: {type(compressed_layers)}")
         # Determine new layer sizes and offsets
         new_layer_sizes = [original_layer_sizes[0]] # Input layer size
         for i in range(1, len(original_layer_sizes) - 1): # Hidden layers
@@ -440,11 +479,11 @@ class NeuralNetworkCompressor:
                 new_in_features = new_layer_sizes[linear_layer_idx]
                 new_out_features = new_layer_sizes[linear_layer_idx + 1]
 
-                # Extract new weights from X_compressed
+                # Extract new weights from Y
                 new_offset_src = new_offsets[linear_layer_idx]
                 new_offset_dest = new_offsets[linear_layer_idx + 1]
                 
-                W_new_block = X_compressed[new_offset_src : new_offset_src + new_in_features, 
+                W_new_block = Y[new_offset_src : new_offset_src + new_in_features, 
                                            new_offset_dest : new_offset_dest + new_out_features]
                 
                 W_new_pytorch = torch.tensor(W_new_block.T, 
@@ -498,7 +537,9 @@ class NeuralNetworkCompressor:
             return deepcopy(self.model)
 
         print(f"Global adjacency matrix X created with shape: {X.shape}")
-        
+        pd.DataFrame(X).to_csv("X.csv")
+
+
         # Step 2: Determine dimensions for original (N) and compressed (M) graphs
         N = X.shape[0]
         n_input = layer_sizes[0]
@@ -525,16 +566,21 @@ class NeuralNetworkCompressor:
         print(f"DA complete. Partition matrix P has shape: {P.shape}")
         # print(np.round(P, 3))
         # print(np.round(centroids,5))
-        # print("Y")
-        # print(np.round(Y,5))
+        pd.DataFrame(P).to_csv("P.csv")
 
         # Step 5: Calculate the compressed global adjacency matrix
-        X_compressed = centroids @ P
-        print(f"Compressed global adjacency matrix X_compressed created with shape: {X_compressed.shape}")
+        Y = centroids @ P
+        # print("❌Y")
+        # print(Y)
+        # Y = self.rearrange_Y_matrix(Y,P,layer_sizes)
+        pd.DataFrame(np.round(Y,5)).to_csv("x_cube_Y.csv")
+        # np.savetxt("x_cube_Y.csv", np.round(Y,5), delimiter = ",")
+        print("Y saved as X_cube_Y.csv")
+        print(f"Compressed global adjacency matrix Y created with shape: {Y.shape}")
 
         # Step 6: Reconstruct the compressed model
         print("Reconstructing the compressed model...")
-        compressed_model = self.reconstruct_compressed_model(X_compressed, P, original_layer_info, layer_sizes, M)
+        compressed_model = self.reconstruct_compressed_model(Y, P, original_layer_info, layer_sizes, M)
         print("Compressed model reconstructed.")
         
         # Store compressed parameters and stats
@@ -1110,7 +1156,7 @@ class SingleNN(nn.Module):
 criterion  = nn.MSELoss()
 
 
-df = pd.read_csv("/Users/aryandangi/Library/Mobile Documents/com~apple~CloudDocs/Inventory/Work Portfolio/IIT/Courses/CS/BTP/Compression-of-Neural-Networks/Codes/Data/x_Cube_no_noise.csv", header = None)
+df = pd.read_csv("/Users/aryandangi/Library/Mobile Documents/com~apple~CloudDocs/Inventory/Work Portfolio/IIT/Courses/CS/BTP/Compression-of-Neural-Networks/Codes/Data/x_cube_1_10_10_1.csv", header = None)
 df = df.drop(index = 0)
 df = df.astype(float)
 
@@ -1148,7 +1194,7 @@ print(f"Using device: {device}")
 
 # Load the saved weights
 try:
-    model = torch.load("/Users/aryandangi/Library/Mobile Documents/com~apple~CloudDocs/Inventory/Work Portfolio/IIT/Courses/CS/BTP/Compression-of-Neural-Networks/Codes/Models /x_Cube_no_noise.pth",map_location=device, weights_only = False)
+    model = torch.load("/Users/aryandangi/Library/Mobile Documents/com~apple~CloudDocs/Inventory/Work Portfolio/IIT/Courses/CS/BTP/Compression-of-Neural-Networks/Codes/Models /x_cube_1_10_10_1.pth",map_location=device, weights_only = False)
     print("Model loaded.")
 except Exception as e:
     print("Error loading:", e)
@@ -1192,11 +1238,16 @@ def eval_regression(model, loader):
     return original_avg_loss, original_r2
 
 # Test Script
-CRs = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+# CRs = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 # pert = [0.0005, 0.001, 0.005, 0.01]
 
-# CRs = [0.9,0.7,0.6]
+
+CRs = [0.4]
 pert = [0.0005]
+
+# print("Original Model Weights")
+# for name,param in model.named_parameters():
+#     print("\n", name," | ", param.shape, "\n", param.data)
 
 results_df = pd.DataFrame(columns=[
      'Comp ratio',
@@ -1252,9 +1303,9 @@ for ratio in CRs:
             exit(1)
         
         # Print compressed model architecture
-        print("\nCompressed model architecture:")
-        for name, param in compressed_model.named_parameters():
-            print(f"{name}: {param.shape}")
+        # print("\nCompressed model architecture:")
+        # for name, param in compressed_model.named_parameters():
+        #     print(f"{name}: {param.data}")
         
         end_time = time.time()
         duration = end_time - start_time
@@ -1273,8 +1324,8 @@ for ratio in CRs:
         #     print(f"Error during model comparison: {e}")
         #     traceback.print_exc()
         
-        # compressor.visualize_trained_network(model)
-        # compressor.visualize_trained_network(compressed_model)
+        compressor.visualize_trained_network(model)
+        compressor.visualize_trained_network(compressed_model)
         # Visualize compression with optimized edge sampling
         # try:
         #     # For large graphs, use a smaller percentage of edges
@@ -1300,8 +1351,8 @@ for ratio in CRs:
 
 print("\n--- All test runs complete. ---")
 if not results_df.empty:
-    results_df.to_csv(results_file_path, index=False)
-    print(f"Results saved to '{results_file_path}'")
+    # results_df.to_csv(results_file_path, index=False)
+    print(f"Results not saved to '{results_file_path}'")
     print("\nFinal Results Summary:")
     print(results_df)
 else:
